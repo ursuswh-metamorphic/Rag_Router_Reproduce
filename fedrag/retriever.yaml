@@ -1,0 +1,6 @@
+query_embedding_model: "ncbi/MedCPT-Query-Encoder"
+article_embedding_model: "ncbi/MedCPT-Article-Encoder"
+embedding_dimension: 768
+pooling: "cls"
+max_length: 512
+normalize_embeddings: true

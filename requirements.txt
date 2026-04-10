@@ -1,0 +1,13 @@
+# Core runtime dependencies for this repository
+flwr[simulation]>=1.23.0
+numpy>=1.26.0,<2
+faiss-cpu>=1.10.0
+scikit-learn>=1.5.0
+tqdm>=4.67
+transformers>=4.49.0
+sentence-transformers>=3.4.1
+
+# Explicit runtime deps imported in source files
+torch>=2.2.0
+requests>=2.31.0
+PyYAML>=6.0.1
