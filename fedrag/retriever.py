@@ -1,5 +1,6 @@
 """fedrag: A Flower Federated RAG app."""
 
+import contextlib
 import warnings
 import shutil
 import time
@@ -27,6 +28,19 @@ FAISS_SHARD_DIRNAME = "faiss_shards"
 FAISS_MANIFEST_NAME = "faiss_manifest.json"
 FAISS_SHARD_FILES = max(1, int(os.environ.get("FEDRAG_FAISS_SHARD_FILES", "25")))
 FAISS_USE_IVF = os.environ.get("FEDRAG_FAISS_USE_IVF", "0") == "1"
+FAISS_IVF_MIN_POINTS_PER_CENTROID = max(
+    1, int(os.environ.get("FEDRAG_FAISS_IVF_MIN_POINTS_PER_CENTROID", "39"))
+)
+FAISS_NUM_THREADS = max(
+    1, int(os.environ.get("FEDRAG_FAISS_NUM_THREADS", str(os.cpu_count() or 1)))
+)
+LOG_EVERY_BATCHES = max(1, int(os.environ.get("FEDRAG_LOG_EVERY_BATCHES", "50")))
+LOG_EVERY_FILES = max(1, int(os.environ.get("FEDRAG_LOG_EVERY_FILES", "10")))
+SAVE_SHARD_VECTORS = os.environ.get("FEDRAG_SAVE_SHARD_VECTORS", "0") == "1"
+ENABLE_AMP = os.environ.get("FEDRAG_ENABLE_AMP", "1") == "1"
+AMP_DTYPE = os.environ.get("FEDRAG_AMP_DTYPE", "fp16").lower()
+ENABLE_TF32 = os.environ.get("FEDRAG_ENABLE_TF32", "1") == "1"
+ENABLE_TORCH_COMPILE = os.environ.get("FEDRAG_TORCH_COMPILE", "0") == "1"
 
 
 class FaissIndexBundle:
@@ -51,7 +65,12 @@ class FaissIndexBundle:
             for shard_info in manifest.get("shards", []):
                 index_path = os.path.join(dataset_dir, shard_info["index_path"])
                 doc_ids_path = os.path.join(dataset_dir, shard_info["doc_ids_path"])
-                vectors_path = os.path.join(dataset_dir, shard_info["vectors_path"])
+                vectors_rel_path = shard_info.get("vectors_path")
+                vectors_path = (
+                    os.path.join(dataset_dir, vectors_rel_path)
+                    if vectors_rel_path
+                    else None
+                )
                 if not os.path.exists(index_path) or not os.path.exists(doc_ids_path):
                     raise RuntimeError(
                         f"Missing FAISS shard files for {dataset_name}: {index_path} or {doc_ids_path}"
@@ -60,7 +79,11 @@ class FaissIndexBundle:
                     {
                         "index": faiss.read_index(index_path),
                         "doc_ids": np.load(doc_ids_path, allow_pickle=False),
-                        "vectors_path": vectors_path if os.path.exists(vectors_path) else None,
+                        "vectors_path": (
+                            vectors_path
+                            if vectors_path and os.path.exists(vectors_path)
+                            else None
+                        ),
                     }
                 )
             return cls(shards)
@@ -181,6 +204,9 @@ class Retriever:
             return index
 
         nlist = min(max(1, int(np.sqrt(len(embeddings)))), len(embeddings) - 1)
+        max_nlist_by_points = len(embeddings) // FAISS_IVF_MIN_POINTS_PER_CENTROID
+        if max_nlist_by_points > 0:
+            nlist = min(nlist, max_nlist_by_points)
         if nlist < 2:
             index = faiss.IndexFlatL2(d)
             index.add(embeddings)
@@ -235,18 +261,55 @@ class Retriever:
         self.normalize_embeddings = self.config.get("normalize_embeddings", True)
         self.pooling = self.config.get("pooling", "cls")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        self.query_tokenizer = AutoTokenizer.from_pretrained(self.query_model_name)
-        self.query_encoder = AutoModel.from_pretrained(self.query_model_name).to(
-            self.device
+        self.enable_amp = ENABLE_AMP and self.device.type == "cuda"
+        self.enable_torch_compile = (
+            ENABLE_TORCH_COMPILE and self.device.type == "cuda" and hasattr(torch, "compile")
         )
-        self.query_encoder.eval()
 
-        self.article_tokenizer = AutoTokenizer.from_pretrained(self.article_model_name)
-        self.article_encoder = AutoModel.from_pretrained(self.article_model_name).to(
-            self.device
+        if AMP_DTYPE == "bf16":
+            if self.device.type == "cuda" and torch.cuda.is_bf16_supported():
+                self.amp_dtype = torch.bfloat16
+            else:
+                self.amp_dtype = torch.float16
+                if self.device.type == "cuda":
+                    tqdm.write("bf16 requested but not supported on this GPU; falling back to fp16.")
+        else:
+            self.amp_dtype = torch.float16
+
+        if self.device.type == "cuda":
+            if ENABLE_TF32:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            torch.set_float32_matmul_precision("high")
+
+        faiss.omp_set_num_threads(FAISS_NUM_THREADS)
+
+        self.query_tokenizer = None
+        self.query_encoder = None
+
+        self.article_tokenizer, self.article_encoder = self._load_encoder(
+            self.article_model_name
         )
-        self.article_encoder.eval()
+
+    def _load_encoder(self, model_name):
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        encoder = AutoModel.from_pretrained(model_name).to(self.device)
+        encoder.eval()
+
+        if self.enable_torch_compile:
+            try:
+                encoder = torch.compile(encoder, mode="max-autotune")
+            except Exception as exc:
+                tqdm.write(f"Warning: torch.compile disabled for {model_name}: {exc}")
+
+        return tokenizer, encoder
+
+    def _ensure_query_encoder(self):
+        if self.query_tokenizer is None or self.query_encoder is None:
+            self.query_tokenizer, self.query_encoder = self._load_encoder(
+                self.query_model_name
+            )
 
     def _pool_embeddings(self, model_output, attention_mask):
         if self.pooling == "mean":
@@ -275,16 +338,24 @@ class Retriever:
             key: value.to(self.device) for key, value in encoded_inputs.items()
         }
 
-        with torch.no_grad():
-            model_output = encoder(**encoded_inputs)
-            embeddings = self._pool_embeddings(
-                model_output, encoded_inputs["attention_mask"]
-            )
-            if self.normalize_embeddings:
-                embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+        autocast_ctx = (
+            torch.autocast(device_type="cuda", dtype=self.amp_dtype)
+            if self.enable_amp
+            else contextlib.nullcontext()
+        )
+        with torch.inference_mode():
+            with autocast_ctx:
+                model_output = encoder(**encoded_inputs)
+                embeddings = self._pool_embeddings(
+                    model_output, encoded_inputs["attention_mask"]
+                )
+                if self.normalize_embeddings:
+                    embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+
+        embeddings = embeddings.float()
 
         if convert_to_numpy:
-            embeddings = embeddings.cpu().numpy().astype("float32")
+            embeddings = embeddings.cpu().numpy().astype("float32", copy=False)
             if single_input:
                 return embeddings[0]
             return embeddings
@@ -294,6 +365,7 @@ class Retriever:
         return embeddings
 
     def encode_query(self, text, convert_to_numpy=True):
+        self._ensure_query_encoder()
         return self._encode_texts(
             text,
             tokenizer=self.query_tokenizer,
@@ -362,8 +434,11 @@ class Retriever:
             vectors_path = os.path.join(shard_dir, f"{shard_prefix}.vectors.npy")
 
             faiss.write_index(shard_index, index_path)
-            np.save(doc_ids_path, shard_doc_ids)
-            np.save(vectors_path, shard_embeddings)
+            np.save(doc_ids_path, shard_doc_ids, allow_pickle=False)
+            vectors_rel_path = None
+            if SAVE_SHARD_VECTORS:
+                np.save(vectors_path, shard_embeddings, allow_pickle=False)
+                vectors_rel_path = os.path.relpath(vectors_path, dataset_dir)
 
             shard_elapsed = max(time.time() - shard_started_at, 1e-6)
             shard_rate = len(shard_doc_ids) / shard_elapsed
@@ -374,7 +449,7 @@ class Retriever:
             return {
                 "index_path": os.path.relpath(index_path, dataset_dir),
                 "doc_ids_path": os.path.relpath(doc_ids_path, dataset_dir),
-                "vectors_path": os.path.relpath(vectors_path, dataset_dir),
+                "vectors_path": vectors_rel_path,
                 "num_items": int(len(shard_doc_ids)),
                 "chunk_files": list(shard_chunk_files),
             }
@@ -399,9 +474,10 @@ class Retriever:
                         shard_items.extend(zip(batch_ids, batch_embeddings))
                         processed_docs += len(batch_ids)
                         processed_batches += 1
-                        tqdm.write(
-                            f"{dataset_name}: processed {processed_docs} docs in {processed_batches} batches"
-                        )
+                        if processed_batches % LOG_EVERY_BATCHES == 0:
+                            tqdm.write(
+                                f"{dataset_name}: processed {processed_docs} docs in {processed_batches} batches"
+                            )
                         batch_content, batch_ids = [], []
 
                 if batch_content:
@@ -413,14 +489,18 @@ class Retriever:
                     shard_items.extend(zip(batch_ids, batch_embeddings))
                     processed_docs += len(batch_ids)
                     processed_batches += 1
-                    tqdm.write(
-                        f"{dataset_name}: processed {processed_docs} docs in {processed_batches} batches"
-                    )
+                    if processed_batches % LOG_EVERY_BATCHES == 0:
+                        tqdm.write(
+                            f"{dataset_name}: processed {processed_docs} docs in {processed_batches} batches"
+                        )
 
             shard_file_count += 1
             shard_chunk_files.append(os.path.relpath(filename, dataset_dir))
             processed_files += 1
-            tqdm.write(f"{dataset_name}: finished {processed_files}/{total_files} chunk files")
+            if processed_files % LOG_EVERY_FILES == 0 or processed_files == total_files:
+                tqdm.write(
+                    f"{dataset_name}: finished {processed_files}/{total_files} chunk files"
+                )
 
             if shard_file_count >= shard_file_limit:
                 shard_entry = flush_shard(shard_id)
