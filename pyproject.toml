@@ -35,6 +35,13 @@ server-qa-datasets = "pubmedqa|bioasq|mmlu|medqa|medmcqa"
 # Force to only evaluate the first 10 questions from each benchmark
 # dataset, if this value is not set, then evaluate all questions
 # server-qa-num = 10
+# Leave server-qa-num unset to process all MIRAGE questions.
+# Optional: point to a split MIRAGE file path (relative to repo root or absolute).
+# If unset, defaults to data/mirage.json.
+# mirage-file-path = "data/mirage.train.json"
+# Optional: output JSONL path for generated router labels.
+# If unset, defaults to RagRoute/router_training_data.jsonl.
+# router-output-path = "RagRoute/router_training_data.train.jsonl"
 # Pass corpus as "StatPearls|Textbooks", the corpus will be assigned
 # to each client participating in the federation in a Round-Robin fashion
 # The supported corpora are:
@@ -64,6 +71,9 @@ server-llm-use-gpu = "false"
 default = "local-simulation"
 
 [tool.flwr.federations.local-simulation]
-options.num-supernodes = 2
+# 4 supernodes so all 4 corpora can participate in parallel.
+options.num-supernodes = 4
+# 8 vCPU machine profile: 4 clients x 2 CPU each.
 options.backend.client-resources.num-cpus = 2
-options.backend.client-resources.num-gpus = 0
+# 48GB VRAM profile: keep headroom by assigning 0.18 GPU per client.
+options.backend.client-resources.num-gpus = 0.18

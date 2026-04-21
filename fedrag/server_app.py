@@ -19,7 +19,20 @@ from fedrag.task import index_exists
 ROUTER_DATASET_PATH = os.path.join(
     os.path.dirname(__file__), "../RagRoute/router_training_data.jsonl"
 )
+DEFAULT_MIRAGE_PATH = os.path.join(os.path.dirname(__file__), "../data/mirage.json")
 MAX_METADATA_VECTORS = 2048
+
+
+def resolve_repo_path(path_value: str | None, default_path: str) -> str:
+    if path_value is None or str(path_value).strip() == "":
+        return os.path.abspath(default_path)
+
+    path_value = str(path_value)
+    if os.path.isabs(path_value):
+        return os.path.abspath(path_value)
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    return os.path.abspath(os.path.join(repo_root, path_value))
 
 
 def node_online_loop(grid: Grid) -> list[int]:
@@ -216,15 +229,28 @@ def main(grid: Grid, context: Context) -> None:
     qa_datasets = [qa_d.lower() for qa_d in qa_datasets]  # make them lower case
     qa_num = context.run_config.get("server-qa-num", None)
 
-    mirage_file = os.path.join(os.path.dirname(__file__), "../data/mirage.json")
+    mirage_file_cfg = context.run_config.get(
+        "mirage-file-path", os.environ.get("FEDRAG_MIRAGE_FILE")
+    )
+    mirage_file = resolve_repo_path(mirage_file_cfg, DEFAULT_MIRAGE_PATH)
+    if not os.path.exists(mirage_file):
+        raise FileNotFoundError(
+            f"MIRAGE file was not found: {mirage_file}. "
+            "Set run-config 'mirage-file-path' or env 'FEDRAG_MIRAGE_FILE'."
+        )
     datasets = {key: MirageQA(key, mirage_file) for key in qa_datasets}
 
     retriever = Retriever()
     index_by_corpus, metadata_by_corpus = build_metadata_store(
         corpus_names, retriever.emb_dim
     )
-    output_path = context.run_config.get("router-output-path", ROUTER_DATASET_PATH)
+    output_path_cfg = context.run_config.get(
+        "router-output-path", os.environ.get("FEDRAG_ROUTER_OUTPUT_PATH")
+    )
+    output_path = resolve_repo_path(output_path_cfg, ROUTER_DATASET_PATH)
     open(output_path, "w", encoding="utf-8").close()
+    print(f"Using MIRAGE benchmark file: {mirage_file}")
+    print(f"Writing router dataset to: {output_path}")
 
     question_times = defaultdict(list)
     label_distribution = defaultdict(list)
