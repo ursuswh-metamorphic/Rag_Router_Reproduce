@@ -4,6 +4,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import sys
+import time
 from pathlib import Path
 
 DIR_PATH = os.path.dirname(os.path.realpath(__file__))
@@ -17,6 +18,27 @@ from fedrag.retriever import Retriever
 
 
 VALID_DATASETS = ["pubmed", "statpearls", "textbooks", "wikipedia"]
+
+MAX_DOWNLOAD_ATTEMPTS = 5
+DOWNLOAD_RETRY_BACKOFF_SECONDS = 20
+
+
+def _remount_drive_if_colab() -> None:
+    """Best-effort remount of a mounted Google Drive after a FUSE hiccup.
+
+    A Drive mount on Colab can drop mid-download during long sustained writes
+    (errno 107 "Transport endpoint is not connected" and similar). Remounting
+    re-establishes the FUSE connection so a retry can pick up where it left
+    off. This is a no-op outside Colab, where google.colab is unavailable.
+    """
+    try:
+        from google.colab import drive
+    except ImportError:
+        return
+    try:
+        drive.mount("/content/drive", force_remount=True)
+    except Exception as exc:
+        print(f"Drive remount attempt failed: {exc}")
 
 if __name__ == "__main__":
 
@@ -86,9 +108,21 @@ if __name__ == "__main__":
 
     def download_corpus(dataset_name: str) -> str:
         print(f"Downloading corpus: {dataset_name}")
-        DownloadCorpora.download(corpus=dataset_name, download_dir=storage_dir)
-        print(f"Downloaded corpus: {dataset_name}")
-        return dataset_name
+        for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
+            try:
+                DownloadCorpora.download(corpus=dataset_name, download_dir=storage_dir)
+                print(f"Downloaded corpus: {dataset_name}")
+                return dataset_name
+            except OSError as exc:
+                if attempt == MAX_DOWNLOAD_ATTEMPTS:
+                    raise
+                print(
+                    f"Download of {dataset_name} hit a filesystem error on attempt "
+                    f"{attempt}/{MAX_DOWNLOAD_ATTEMPTS} ({exc}); remounting Drive "
+                    f"and retrying in {DOWNLOAD_RETRY_BACKOFF_SECONDS}s..."
+                )
+                _remount_drive_if_colab()
+                time.sleep(DOWNLOAD_RETRY_BACKOFF_SECONDS)
 
     downloaded_datasets = set()
     valid_dataset_names = [
