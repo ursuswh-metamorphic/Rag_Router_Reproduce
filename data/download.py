@@ -1,6 +1,7 @@
 """fedrag: A Flower Federated RAG app."""
 
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -61,9 +62,19 @@ class DownloadCorpora:
         # If the corpus already exists, only skip it when the download looks complete.
         if corpus != "statpearls" and os.path.isdir(fullpath):
             if cls._needs_lfs_repair(fullpath):
+                if not os.path.isdir(os.path.join(fullpath, ".git")):
+                    raise RuntimeError(
+                        f"{fullpath} looks incomplete but has no .git directory to repair "
+                        "from (git metadata is stripped after a verified download to save "
+                        "space). Delete the directory and rerun the downloader so it can "
+                        "re-clone from scratch."
+                    )
                 os.makedirs(hooks_path, exist_ok=True)
                 subprocess.run(
-                    ["git", *git_hooks_override, "lfs", "pull"], check=True, cwd=fullpath
+                    ["git", *git_hooks_override, "lfs", "pull"],
+                    check=True,
+                    cwd=fullpath,
+                    env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
                 )
             print(f"Downloaded {corpus} corpus at {fullpath}.")
             return fullpath
@@ -76,21 +87,46 @@ class DownloadCorpora:
             repo_url = f"https://huggingface.co/datasets/MedRAG/{corpus}"
             clone_env = os.environ.copy()
             clone_env["GIT_LFS_SKIP_SMUDGE"] = "1"
-            os.makedirs(hooks_path, exist_ok=True)
-            subprocess.run(
-                ["git", "clone", *git_hooks_override, repo_url, fullpath],
-                check=True,
-                env=clone_env,
-            )
-            # Go to the new directory and pull all large files using the Git LFS extension, and back again
-            subprocess.run(
-                ["git", *git_hooks_override, "lfs", "pull"], check=True, cwd=fullpath
-            )
-            if cls._needs_lfs_repair(fullpath):
-                raise RuntimeError(
-                    f"Corpus download finished but some Git LFS files are still missing or pointer-only at {fullpath}. "
-                    "Run git lfs pull again inside the corpus directory or delete the directory and rerun the downloader."
+            # Fail fast instead of hanging forever if the LFS remote ever asks
+            # for credentials on this (non-interactive, nohup'd) stdin.
+            clone_env["GIT_TERMINAL_PROMPT"] = "0"
+
+            # Clone to LOCAL disk first, never straight into download_dir: git and
+            # git-lfs writing thousands of small objects directly onto a network
+            # mount (e.g. Google Drive on Colab) is unreliable in practice - we've
+            # hit both "Permission denied" execing a hook script and "Software
+            # caused connection abort" mid-checkout doing this. A local staging
+            # clone sidesteps both; only a plain directory move touches the mount.
+            staging_root = tempfile.mkdtemp(prefix="fedrag_corpus_staging_")
+            staging_path = os.path.join(staging_root, corpus)
+            try:
+                subprocess.run(
+                    ["git", "clone", *git_hooks_override, repo_url, staging_path],
+                    check=True,
+                    env=clone_env,
                 )
+                # Go to the new directory and pull all large files using the Git LFS extension, and back again
+                subprocess.run(
+                    ["git", *git_hooks_override, "lfs", "pull"],
+                    check=True,
+                    cwd=staging_path,
+                    env=clone_env,
+                )
+                if cls._needs_lfs_repair(staging_path):
+                    raise RuntimeError(
+                        f"Corpus download finished but some Git LFS files are still missing "
+                        f"or pointer-only in the staging clone at {staging_path}."
+                    )
+                # Drop git metadata before moving onto the (possibly quota-constrained)
+                # final destination: .git/lfs/objects duplicates every tracked file
+                # already present in the checked-out working tree, roughly doubling
+                # on-disk size for no benefit once the download is verified complete.
+                shutil.rmtree(os.path.join(staging_path, ".git"), ignore_errors=True)
+                if os.path.exists(fullpath):
+                    shutil.rmtree(fullpath)
+                shutil.move(staging_path, fullpath)
+            finally:
+                shutil.rmtree(staging_root, ignore_errors=True)
         else:
             # Download directly from the NIH repo
             archive_url = "https://ftp.ncbi.nlm.nih.gov/pub/litarch/3d/12/statpearls_NBK430685.tar.gz"
