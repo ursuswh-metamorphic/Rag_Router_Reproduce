@@ -11,3 +11,4 @@ sentence-transformers>=3.4.1
 torch>=2.2.0
 requests>=2.31.0
 PyYAML>=6.0.1
+huggingface_hub>=0.26.0
