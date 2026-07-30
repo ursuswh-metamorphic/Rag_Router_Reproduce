@@ -2,6 +2,7 @@
 
 import os
 import subprocess
+import tempfile
 from pathlib import Path
 
 DIR_PATH = os.path.dirname(os.path.realpath(__file__))
@@ -50,10 +51,20 @@ class DownloadCorpora:
         Path(download_dir).mkdir(parents=True, exist_ok=True)
 
         fullpath = os.path.join(download_dir, corpus)
+        # download_dir may be a network-backed mount (e.g. Google Drive on Colab)
+        # that does not support executing files stored on it. Point git's hook
+        # lookup at a local, non-mounted directory so post-checkout/post-merge
+        # hooks installed by `git lfs install` never need to exec from the mount.
+        hooks_path = os.path.join(tempfile.gettempdir(), "fedrag_git_hooks_disabled")
+        git_hooks_override = ["-c", f"core.hooksPath={hooks_path}"]
+
         # If the corpus already exists, only skip it when the download looks complete.
         if corpus != "statpearls" and os.path.isdir(fullpath):
             if cls._needs_lfs_repair(fullpath):
-                subprocess.run(["git", "lfs", "pull"], check=True, cwd=fullpath)
+                os.makedirs(hooks_path, exist_ok=True)
+                subprocess.run(
+                    ["git", *git_hooks_override, "lfs", "pull"], check=True, cwd=fullpath
+                )
             print(f"Downloaded {corpus} corpus at {fullpath}.")
             return fullpath
 
@@ -65,13 +76,16 @@ class DownloadCorpora:
             repo_url = f"https://huggingface.co/datasets/MedRAG/{corpus}"
             clone_env = os.environ.copy()
             clone_env["GIT_LFS_SKIP_SMUDGE"] = "1"
+            os.makedirs(hooks_path, exist_ok=True)
             subprocess.run(
-                ["git", "clone", repo_url, fullpath],
+                ["git", "clone", *git_hooks_override, repo_url, fullpath],
                 check=True,
                 env=clone_env,
             )
             # Go to the new directory and pull all large files using the Git LFS extension, and back again
-            subprocess.run(["git", "lfs", "pull"], check=True, cwd=fullpath)
+            subprocess.run(
+                ["git", *git_hooks_override, "lfs", "pull"], check=True, cwd=fullpath
+            )
             if cls._needs_lfs_repair(fullpath):
                 raise RuntimeError(
                     f"Corpus download finished but some Git LFS files are still missing or pointer-only at {fullpath}. "
