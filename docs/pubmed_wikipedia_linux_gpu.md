@@ -17,18 +17,38 @@ thay cho `git clone`, không phụ thuộc Drive hay git-lfs nữa.
 ## 1. Clone repo & cài môi trường
 
 ```bash
+cd /workspace
 git clone https://github.com/ursuswh-metamorphic/Rag_Router_Reproduce.git fedrag
-cd fedrag
+cd /workspace/fedrag
 
+deactivate 2>/dev/null || true
+deactivate 2>/dev/null || true
+
+unset PYTHONHOME
+unset PYTHONPATH
+
+rm -rf .venv
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+
+python -m pip install -U pip setuptools wheel
+python -m pip install -r requirements.txt
+
+python -m pip uninstall -y torch torchvision torchaudio
+python -m pip cache purge
+python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 ```
 
-Kiểm tra torch thấy GPU:
+Kiểm tra  GPU:
 
 ```bash
-python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+python - <<'PY'
+import torch
+print(torch.__version__)
+print("cuda:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("gpu:", torch.cuda.get_device_name(0))
+PY
 ```
 
 Nếu `False`, cài lại torch đúng bản CUDA của máy theo hướng dẫn tại
