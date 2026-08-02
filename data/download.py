@@ -4,7 +4,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from huggingface_hub import snapshot_download
+from huggingface_hub import HfApi, snapshot_download
 
 DIR_PATH = os.path.dirname(os.path.realpath(__file__))
 CORPUS_DIR = os.path.abspath(
@@ -25,8 +25,22 @@ class DownloadCorpora:
         except (OSError, UnicodeDecodeError):
             return False
 
+    @staticmethod
+    def _expected_chunk_count(repo_id: str):
+        """Number of chunk/*.jsonl files the Hub repo actually has.
+
+        Returns None (meaning "can't verify, don't block on it") if the Hub
+        API call itself fails, e.g. no network -- we still want a fully
+        on-disk corpus to be usable offline.
+        """
+        try:
+            files = HfApi().list_repo_files(repo_id, repo_type="dataset")
+        except Exception:
+            return None
+        return sum(1 for f in files if f.startswith("chunk/") and f.endswith(".jsonl"))
+
     @classmethod
-    def _needs_lfs_repair(cls, corpus_dir: str) -> bool:
+    def _needs_lfs_repair(cls, corpus_dir: str, repo_id: str = None) -> bool:
         chunk_dir = os.path.join(corpus_dir, "chunk")
         if not os.path.isdir(chunk_dir):
             return True
@@ -39,10 +53,24 @@ class DownloadCorpora:
         if not chunk_files:
             return True
 
-        return any(
+        if any(
             os.path.getsize(file_path) == 0 or cls._is_lfs_pointer(file_path)
             for file_path in chunk_files
-        )
+        ):
+            return True
+
+        # A previous run that got interrupted mid-download (crash, Ctrl-C, a
+        # dropped connection) can leave a subset of chunk files that are all
+        # individually valid but far from the full corpus. Checking each
+        # file's own health isn't enough -- also check the count against what
+        # the Hub repo actually has, so an incomplete corpus doesn't silently
+        # get treated as done.
+        if repo_id is not None:
+            expected = cls._expected_chunk_count(repo_id)
+            if expected is not None and len(chunk_files) < expected:
+                return True
+
+        return False
 
     @classmethod
     def download(cls, corpus: str, download_dir: str = None) -> str:
@@ -52,10 +80,11 @@ class DownloadCorpora:
         Path(download_dir).mkdir(parents=True, exist_ok=True)
 
         fullpath = os.path.join(download_dir, corpus)
+        repo_id = f"MedRAG/{corpus}"
 
         if corpus != "statpearls":
             # If the corpus already exists, only skip it when the download looks complete.
-            if os.path.isdir(fullpath) and not cls._needs_lfs_repair(fullpath):
+            if os.path.isdir(fullpath) and not cls._needs_lfs_repair(fullpath, repo_id=repo_id):
                 print(f"Downloaded {corpus} corpus at {fullpath}.")
                 return fullpath
 
@@ -68,12 +97,12 @@ class DownloadCorpora:
             # abort" mid-checkout). snapshot_download writes each file once, with
             # resumable per-file downloads, and works fine against a Drive path.
             snapshot_download(
-                repo_id=f"MedRAG/{corpus}",
+                repo_id=repo_id,
                 repo_type="dataset",
                 local_dir=fullpath,
                 max_workers=4,
             )
-            if cls._needs_lfs_repair(fullpath):
+            if cls._needs_lfs_repair(fullpath, repo_id=repo_id):
                 raise RuntimeError(
                     f"Corpus download finished but some files are still missing or "
                     f"empty at {fullpath}. Delete the directory and rerun the downloader."
