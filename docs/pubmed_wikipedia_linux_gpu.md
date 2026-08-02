@@ -1,16 +1,16 @@
 # Build PubMed & Wikipedia trên Linux GPU (thay vì Colab)
 
-StatPearls và Textbooks đã build xong trên Colab, đang nằm trên Google Drive
-(`fedrag_corpus/statpearls`, `fedrag_corpus/textbooks`). PubMed và Wikipedia
-quá lâu để chạy trên Colab nên build tiếp trên máy Linux GPU, lưu **local**
-(không cần mount Drive — máy này không gặp các lỗi FUSE đã thấy trên Colab
-vì `data/download.py` giờ dùng `huggingface_hub.snapshot_download` thay cho
-`git clone`, không phụ thuộc Drive hay git-lfs nữa).
+StatPearls và Textbooks đã build xong trên Colab (nằm trên Google Drive).
+PubMed và Wikipedia quá lâu để chạy trên Colab nên build tiếp trên máy Linux
+GPU, lưu **local** trên máy này (gộp lại với StatPearls/Textbooks sau, không
+cần làm ngay bây giờ). Máy Linux không mount Drive nên không gặp các lỗi FUSE
+đã thấy trên Colab — `data/download.py` giờ dùng `huggingface_hub.snapshot_download`
+thay cho `git clone`, không phụ thuộc Drive hay git-lfs nữa.
 
 ## 0. Yêu cầu
 
 - GPU NVIDIA + driver đã cài (`nvidia-smi` chạy được).
-- Python 3.10+, git.
+- Python 3.10+, git, `tmux`.
 - Dung lượng ổ đĩa trống **≥ 200 GB** cho corpus text + index của PubMed
   (23.9M snippet) + Wikipedia (29.9M snippet). Kiểm tra trước: `df -h .`
 
@@ -34,31 +34,27 @@ python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_
 Nếu `False`, cài lại torch đúng bản CUDA của máy theo hướng dẫn tại
 pytorch.org (ví dụ CUDA 12.1: `pip install torch --index-url https://download.pytorch.org/whl/cu121`).
 
-## 2. Gộp StatPearls & Textbooks đã build sẵn về máy này (không upload PubMed/Wikipedia ngược lên Drive)
+## 2. Chạy build trong `tmux` — bắt buộc để sống sót khi tắt console
 
-`Retriever` cần cả 4 corpus nằm chung 1 thư mục gốc. StatPearls + Textbooks
-rất nhỏ (~0.4 GB tổng) nên tải **xuống** máy Linux rẻ hơn nhiều so với việc
-upload PubMed/Wikipedia (~170 GB) ngược lên Drive.
+`nohup ...&` có thể vẫn bị kill trong một số trường hợp (terminal của IDE,
+SSH client cấu hình khác thường...). Cách chắc chắn nhất là chạy trong một
+session `tmux` độc lập với phiên đăng nhập: đóng hẳn terminal/tắt SSH, tiến
+trình vẫn chạy tiếp trên máy, chỉ cần máy không tắt/reboot.
 
 ```bash
-mkdir -p /data/fedrag_corpus
+# Cài tmux nếu chưa có
+sudo apt-get update && sudo apt-get install -y tmux
+
+# Tạo session mới, đặt tên để dễ tìm lại
+tmux new -s fedrag_build
 ```
 
-Dùng `rclone` (khuyên dùng, xử lý tốt Drive riêng tư qua OAuth):
+**Bên trong session tmux** (sau lệnh trên, bạn đang ở trong session mới):
 
 ```bash
-# Cài rclone: curl https://rclone.org/install.sh | sudo bash
-rclone config                     # chọn "Google Drive", làm theo hướng dẫn OAuth (dán link vào trình duyệt bất kỳ nếu máy không có GUI)
-rclone copy gdrive:fedrag_corpus/statpearls /data/fedrag_corpus/statpearls -P
-rclone copy gdrive:fedrag_corpus/textbooks  /data/fedrag_corpus/textbooks  -P
-```
+cd fedrag
+source .venv/bin/activate
 
-(Không có rclone thì tải 2 thư mục này qua giao diện web Drive rồi `scp`/`rsync`
-lên máy — chỉ ~0.4 GB nên cách nào cũng nhanh.)
-
-## 3. Cấu hình & build PubMed + Wikipedia
-
-```bash
 export FEDRAG_CORPUS_DIR=/data/fedrag_corpus
 export FEDRAG_BQ_OVERSAMPLE_FACTOR=3     # rescore BQ lấy knn*3 ứng viên
 export FEDRAG_ENABLE_AMP=1               # fp16 khi encode MedCPT
@@ -66,43 +62,47 @@ export HF_TOKEN=<token của bạn>          # optional, tránh rate-limit HF Hu
 # FEDRAG_FAISS_SHARD_FILES: để mặc định (25) nếu máy có nhiều RAM hơn Colab (>16GB);
 # hạ xuống (vd 10) nếu RAM hạn chế.
 
-nohup python -m data.prepare \
+python -m data.prepare \
     --datasets pubmed wikipedia \
     --index_num_chunks 0 \
     --storage_dir "$FEDRAG_CORPUS_DIR" \
     --download_workers 2 \
     --batch_size 128 \
-    > build.log 2>&1 &
-
-echo "PID: $!"
+    2>&1 | tee build.log
 ```
 
 `batch_size 128` là điểm khởi đầu — tăng dần (256, 512...) nếu `nvidia-smi`
 cho thấy còn nhiều VRAM trống, để encode MedCPT nhanh hơn.
 
-## 4. Theo dõi
+**Detach khỏi session** (tiến trình vẫn chạy nền): nhấn `Ctrl+b` rồi `d`.
+Giờ có thể đóng terminal/tắt SSH thoải mái.
+
+## 3. Kiểm tra lại / theo dõi bất cứ lúc nào
 
 ```bash
-tail -f build.log
-watch -n 5 nvidia-smi
+tmux ls                    # xem session còn sống không (fedrag_build: ...)
+tmux attach -t fedrag_build  # attach lại để xem trực tiếp
+# (attach xong, muốn detach lại thì lại Ctrl+b rồi d — đừng gõ Ctrl+c/exit)
+
+tail -f fedrag/build.log   # xem log mà không cần attach
+nvidia-smi
 free -h
 ```
 
-`nohup` sống sót qua việc mất kết nối SSH (đóng terminal) — muốn chắc chắn
-hơn nữa thì chạy cả lệnh trong `tmux`/`screen` để có thể attach lại bất cứ lúc nào.
-
-## 5. Kiểm tra sau khi xong
+## 4. Kiểm tra sau khi build xong
 
 ```bash
+cd fedrag
 python -c "
 from fedrag.retriever import Retriever
 r = Retriever(corpus_dir='/data/fedrag_corpus')
-for name in ('statpearls', 'textbooks', 'pubmed', 'wikipedia'):
+for name in ('pubmed', 'wikipedia'):
     res = r.query_faiss_index(name, 'What are the complications of a cardiovascular disease?', knn=3)
     print(name, '->', list(res.keys()))
 "
 ```
 
-Cả 4 corpus giờ nằm chung `/data/fedrag_corpus` trên máy Linux này — dùng
-thẳng thư mục này làm `--storage_dir`/`corpus_dir` cho các bước tiếp theo của
-pipeline (FL simulation, router training...) mà không cần đụng tới Drive nữa.
+Khi nào cần gộp chung với StatPearls/Textbooks (đang trên Drive) thì tải 2
+thư mục đó (`fedrag_corpus/statpearls`, `fedrag_corpus/textbooks`, ~0.4 GB
+tổng) xuống cùng `/data/fedrag_corpus` trên máy này — nhẹ hơn nhiều so với
+upload PubMed/Wikipedia (~170 GB) ngược lên Drive.
