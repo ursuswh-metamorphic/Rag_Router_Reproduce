@@ -113,7 +113,7 @@ if __name__ == "__main__":
                 DownloadCorpora.download(corpus=dataset_name, download_dir=storage_dir)
                 print(f"Downloaded corpus: {dataset_name}")
                 return dataset_name
-            except OSError as exc:
+            except (OSError, RuntimeError) as exc:
                 if attempt == MAX_DOWNLOAD_ATTEMPTS:
                     raise
                 print(

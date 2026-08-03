@@ -11,6 +11,8 @@ CORPUS_DIR = os.path.abspath(
     os.environ.get("FEDRAG_CORPUS_DIR", os.path.join(DIR_PATH, "./corpus"))
 )
 
+MAX_DOWNLOAD_ATTEMPTS = 5
+
 
 class DownloadCorpora:
 
@@ -96,16 +98,31 @@ class DownloadCorpora:
             # ("Permission denied" execing a hook, "Software caused connection
             # abort" mid-checkout). snapshot_download writes each file once, with
             # resumable per-file downloads, and works fine against a Drive path.
-            snapshot_download(
-                repo_id=repo_id,
-                repo_type="dataset",
-                local_dir=fullpath,
-                max_workers=4,
-            )
-            if cls._needs_lfs_repair(fullpath, repo_id=repo_id):
+            #
+            # A single pass can still land some files empty/truncated on flaky
+            # storage backends. snapshot_download itself re-verifies and
+            # re-fetches any file that doesn't match what the repo expects on
+            # a subsequent call (confirmed: truncating a file to 0 bytes and
+            # calling it again restores the correct content), so just retry a
+            # few times in place instead of surfacing a one-shot failure that
+            # forces a manual rerun of the whole pipeline.
+            for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
+                snapshot_download(
+                    repo_id=repo_id,
+                    repo_type="dataset",
+                    local_dir=fullpath,
+                    max_workers=4,
+                )
+                if not cls._needs_lfs_repair(fullpath, repo_id=repo_id):
+                    break
+                print(
+                    f"{corpus}: download attempt {attempt}/{MAX_DOWNLOAD_ATTEMPTS} "
+                    "still incomplete, retrying fetch..."
+                )
+            else:
                 raise RuntimeError(
-                    f"Corpus download finished but some files are still missing or "
-                    f"empty at {fullpath}. Delete the directory and rerun the downloader."
+                    f"Corpus download still incomplete after {MAX_DOWNLOAD_ATTEMPTS} "
+                    f"attempts at {fullpath}. Delete the directory and rerun the downloader."
                 )
         else:
             if os.path.exists(fullpath):
