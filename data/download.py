@@ -28,18 +28,27 @@ class DownloadCorpora:
             return False
 
     @staticmethod
-    def _expected_chunk_count(repo_id: str):
-        """Number of chunk/*.jsonl files the Hub repo actually has.
+    def _expected_chunk_sizes(repo_id: str):
+        """Map of {basename: expected byte size} for chunk/*.jsonl on the Hub.
 
         Returns None (meaning "can't verify, don't block on it") if the Hub
-        API call itself fails, e.g. no network -- we still want a fully
-        on-disk corpus to be usable offline.
+        API call fails, e.g. no network -- a fully on-disk corpus should
+        still be usable offline. Batches the paths-info lookup: the Hub's
+        endpoint 413s if asked about ~1000+ paths in one request.
         """
         try:
-            files = HfApi().list_repo_files(repo_id, repo_type="dataset")
+            api = HfApi()
+            files = api.list_repo_files(repo_id, repo_type="dataset")
+            chunk_paths = [f for f in files if f.startswith("chunk/") and f.endswith(".jsonl")]
+            sizes = {}
+            batch_size = 200
+            for i in range(0, len(chunk_paths), batch_size):
+                batch = chunk_paths[i : i + batch_size]
+                for info in api.get_paths_info(repo_id, batch, repo_type="dataset"):
+                    sizes[os.path.basename(info.path)] = info.size
+            return sizes
         except Exception:
             return None
-        return sum(1 for f in files if f.startswith("chunk/") and f.endswith(".jsonl"))
 
     @classmethod
     def _needs_lfs_repair(cls, corpus_dir: str, repo_id: str = None) -> bool:
@@ -47,32 +56,41 @@ class DownloadCorpora:
         if not os.path.isdir(chunk_dir):
             return True
 
-        chunk_files = [
-            entry.path
+        chunk_files = {
+            entry.name: entry.path
             for entry in os.scandir(chunk_dir)
             if entry.is_file() and entry.name.endswith(".jsonl")
-        ]
+        }
         if not chunk_files:
             return True
 
-        if any(
-            os.path.getsize(file_path) == 0 or cls._is_lfs_pointer(file_path)
-            for file_path in chunk_files
-        ):
-            return True
-
-        # A previous run that got interrupted mid-download (crash, Ctrl-C, a
-        # dropped connection) can leave a subset of chunk files that are all
-        # individually valid but far from the full corpus. Checking each
-        # file's own health isn't enough -- also check the count against what
-        # the Hub repo actually has, so an incomplete corpus doesn't silently
-        # get treated as done.
-        if repo_id is not None:
-            expected = cls._expected_chunk_count(repo_id)
-            if expected is not None and len(chunk_files) < expected:
+        # Compare against the Hub's real per-file sizes when possible. A
+        # previous run that got interrupted mid-download (crash, Ctrl-C, a
+        # dropped connection) can leave files that are individually
+        # nonexistent-or-truncated; comparing sizes catches both a missing
+        # file (count mismatch) and a truncated one (size mismatch) in one
+        # pass. Crucially this also avoids flagging a file as "broken" just
+        # because it's 0 bytes -- some MedRAG chunk files (e.g.
+        # pubmed23n0654.jsonl) are genuinely empty on the Hub itself, and no
+        # amount of retrying downloads a file that was never there.
+        expected_sizes = cls._expected_chunk_sizes(repo_id) if repo_id else None
+        if expected_sizes is not None:
+            if len(chunk_files) < len(expected_sizes):
                 return True
+            return any(
+                os.path.getsize(path) != expected_sizes[name]
+                for name, path in chunk_files.items()
+                if name in expected_sizes
+            )
 
-        return False
+        # No repo_id / API unreachable: fall back to the old heuristic. This
+        # can't distinguish "empty by design" from "corrupted", so it may
+        # false-flag a genuinely-empty chunk file, but a network-down
+        # environment shouldn't block on that.
+        return any(
+            os.path.getsize(path) == 0 or cls._is_lfs_pointer(path)
+            for path in chunk_files.values()
+        )
 
     @classmethod
     def download(cls, corpus: str, download_dir: str = None) -> str:
